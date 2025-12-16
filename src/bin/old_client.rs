@@ -4,7 +4,6 @@ use {
     clap::{Parser, Subcommand, ValueEnum},
     futures::{future::TryFutureExt, sink::SinkExt, stream::StreamExt},
     indicatif::{MultiProgress, ProgressBar, ProgressStyle},
-    inquire::{Select, Text},
     log::{error, info},
     serde_json::{json, Value},
     solana_hash::Hash,
@@ -15,7 +14,6 @@ use {
         collections::HashMap,
         env,
         fs::File,
-        io::{self, Write},
         path::PathBuf,
         str::FromStr,
         sync::Arc,
@@ -73,7 +71,7 @@ impl FromStr for Compression {
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about)]
 struct Args {
-    #[clap(short, long, default_value_t = String::from("https://solana-rpc.parafi.tech:10443"))]
+    #[clap(short, long, default_value_t = String::from("http://127.0.0.1:10000"))]
     /// Service endpoint
     endpoint: String,
 
@@ -81,8 +79,8 @@ struct Args {
     #[clap(long)]
     ca_certificate: Option<PathBuf>,
 
-    #[clap(long, default_value_t = String::from("10443"))]
-    x_token: String,
+    #[clap(long)]
+    x_token: Option<String>,
 
     /// Apply a timeout to connecting to the uri.
     #[clap(long)]
@@ -137,7 +135,7 @@ struct Args {
     commitment: Option<ArgsCommitment>,
 
     #[command(subcommand)]
-    action: Option<Action>,
+    action: Action,
 
     /// Compression default: NONE, [gzip, zstd]
     #[clap(long)]
@@ -156,7 +154,7 @@ impl Args {
             tls_config = tls_config.ca_certificate(Certificate::from_pem(bytes));
         }
         let mut builder = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
-            .x_token(Some(self.x_token.clone()))?
+            .x_token(self.x_token.clone())?
             .tls_config(tls_config)?
             .max_decoding_message_size(self.max_decoding_message_size);
 
@@ -229,13 +227,9 @@ impl From<ArgsCommitment> for CommitmentLevel {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Action {
-    /// Start interactive indexing (default mode)
-    #[clap(alias = "i")]
-    Index,
-    /// Subscribe to updates (can be used with flags or interactively)
-    Subscribe(Box<ActionSubscribe>),
     HealthCheck,
     HealthWatch,
+    Subscribe(Box<ActionSubscribe>),
     SubscribeReplayInfo,
     Ping {
         #[clap(long, short, default_value_t = 0)]
@@ -609,40 +603,7 @@ async fn main() -> anyhow::Result<()> {
     }
     env_logger::init();
 
-    let mut args = Args::parse();
-    
-    // Default to Index (interactive mode) if no action specified
-    // Note: This requires the subcommand to be optional, which clap supports
-    if args.action.is_none() {
-        args.action = Some(Action::Index);
-    }
-    
-    // Handle Index action (interactive mode)
-    if matches!(args.action, Some(Action::Index)) {
-        let interactive_args = interactive_prompt().await?;
-        args.action = Some(Action::Subscribe(Box::new(interactive_args)));
-    }
-    // Check if Subscribe action has no flags set (also run interactive)
-    else if let Some(Action::Subscribe(subscribe_args)) = &args.action {
-        // Check if all subscription flags are false/empty (default state = interactive mode)
-        let is_empty = !subscribe_args.accounts 
-            && !subscribe_args.slots 
-            && !subscribe_args.transactions 
-            && !subscribe_args.transactions_status
-            && !subscribe_args.entries
-            && !subscribe_args.blocks
-            && !subscribe_args.blocks_meta
-            && subscribe_args.accounts_account.is_empty()
-            && subscribe_args.accounts_owner.is_empty()
-            && subscribe_args.transactions_account_include.is_empty();
-        
-        if is_empty {
-            // Run interactive mode
-            println!("🎯 No subscription options provided. Starting interactive mode...\n");
-            let interactive_args = interactive_prompt().await?;
-            args.action = Some(Action::Subscribe(Box::new(interactive_args)));
-        }
-    }
+    let args = Args::parse();
     let zero_attempts = Arc::new(Mutex::new(true));
 
     // The default exponential backoff strategy intervals:
@@ -665,89 +626,62 @@ async fn main() -> anyhow::Result<()> {
             let mut client = args.connect().await.map_err(backoff::Error::transient)?;
             info!("Connected");
 
-            let result = match args.action.as_ref() {
-                Some(Action::Index) => {
-                    // This should never happen as we convert Index to Subscribe above
-                    return Err(backoff::Error::Permanent(anyhow::anyhow!(
-                        "Index action should have been converted to Subscribe"
-                    )));
-                }
-                Some(Action::HealthCheck) => client
+            match &args.action {
+                Action::HealthCheck => client
                     .health_check()
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::HealthWatch) => geyser_health_watch(client)
-                    .await
-                    .map_err(backoff::Error::transient),
-                Some(Action::Subscribe(_)) => {
+                    .map(|response| info!("response: {response:?}")),
+                Action::HealthWatch => geyser_health_watch(client).await,
+                Action::Subscribe(_) => {
                     let (request, resub, stats, verify_encoding) = args
                         .action
-                        .as_ref()
-                        .unwrap()
                         .get_subscribe_request(commitment)
                         .await
                         .map_err(backoff::Error::Permanent)?
-                        .ok_or_else(|| backoff::Error::Permanent(anyhow::anyhow!(
+                        .ok_or(backoff::Error::Permanent(anyhow::anyhow!(
                             "expect subscribe action"
                         )))?;
 
-                    geyser_subscribe(client, request, resub, stats, verify_encoding)
-                        .await
-                        .map_err(backoff::Error::transient)
+                    geyser_subscribe(client, request, resub, stats, verify_encoding).await
                 }
-                Some(Action::SubscribeReplayInfo) => client
+                Action::SubscribeReplayInfo => client
                     .subscribe_replay_info()
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::Ping { count }) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::Ping { count } => client
                     .ping(*count)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::GetLatestBlockhash) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::GetLatestBlockhash => client
                     .get_latest_blockhash(commitment)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::GetBlockHeight) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::GetBlockHeight => client
                     .get_block_height(commitment)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::GetSlot) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::GetSlot => client
                     .get_slot(commitment)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::IsBlockhashValid { blockhash }) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::IsBlockhashValid { blockhash } => client
                     .is_blockhash_valid(blockhash.clone(), commitment)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                Some(Action::GetVersion) => client
+                    .map(|response| info!("response: {response:?}")),
+                Action::GetVersion => client
                     .get_version()
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
-                    .map_err(backoff::Error::transient),
-                None => {
-                    // This should never happen as we set default to Index above
-                    return Err(backoff::Error::Permanent(anyhow::anyhow!(
-                        "No action specified"
-                    )));
-                }
-            };
-
-            result?;
+                    .map(|response| info!("response: {response:?}")),
+            }
+            .map_err(backoff::Error::transient)?;
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
         }
@@ -1108,205 +1042,11 @@ fn print_update(kind: &str, created_at: SystemTime, filters: &[String], value: V
     let unix_since = created_at
         .duration_since(UNIX_EPOCH)
         .expect("valid system time");
-    
-    // Format timestamp
-    let timestamp = format!("{}.{:0>6}", unix_since.as_secs(), unix_since.subsec_micros());
-    
-    // Pretty print JSON with indentation
-    let json_str = serde_json::to_string_pretty(&value)
-        .expect("json serialization failed");
-    
-    // Print with nice formatting
-    println!("\n{}", "=".repeat(80));
-    println!("📦 Update Type: {}", kind.to_uppercase());
-    println!("🔍 Filters: {}", filters.join(", "));
-    println!("⏰ Timestamp: {}", timestamp);
-    println!("{}", "-".repeat(80));
-    
-    // Print each field on a new line
-    if let Value::Object(map) = value {
-        for (key, val) in map.iter() {
-            let val_str = match val {
-                Value::String(s) => {
-                    // Truncate very long strings (like data fields)
-                    if s.len() > 100 {
-                        format!("{}... (truncated, {} chars)", &s[..100], s.len())
-                    } else {
-                        s.clone()
-                    }
-                },
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "null".to_string(),
-                _ => serde_json::to_string(val).unwrap_or_else(|_| "N/A".to_string()),
-            };
-            println!("  {}: {}", key, val_str);
-        }
-    } else {
-        println!("{}", json_str);
-    }
-    
-    println!("{}", "=".repeat(80));
-    io::stdout().flush().unwrap();
-}
-
-async fn interactive_prompt() -> anyhow::Result<ActionSubscribe> {
-    println!("\n🚀 Welcome to Solana Real-Time Indexer CLI\n");
-    
-    let index_type = Select::new(
-        "What would you like to index?",
-        vec!["Accounts", "Transactions", "Slots", "Blocks", "Entries", "Block Meta"]
-    )
-    .prompt()?;
-    
-    let mut subscribe_args = ActionSubscribe {
-        accounts: false,
-        accounts_nonempty_txn_signature: None,
-        accounts_account: vec![],
-        accounts_account_path: None,
-        accounts_owner: vec![],
-        accounts_memcmp: vec![],
-        accounts_datasize: None,
-        accounts_token_account_state: false,
-        accounts_lamports: vec![],
-        accounts_data_slice: vec![],
-        slots: false,
-        slots_filter_by_commitment: None,
-        slots_interslot_updates: None,
-        transactions: false,
-        transactions_vote: None,
-        transactions_failed: None,
-        transactions_signature: None,
-        transactions_account_include: vec![],
-        transactions_account_exclude: vec![],
-        transactions_account_required: vec![],
-        transactions_status: false,
-        transactions_status_vote: None,
-        transactions_status_failed: None,
-        transactions_status_signature: None,
-        transactions_status_account_include: vec![],
-        transactions_status_account_exclude: vec![],
-        transactions_status_account_required: vec![],
-        entries: false,
-        blocks: false,
-        blocks_account_include: vec![],
-        blocks_include_transactions: None,
-        blocks_include_accounts: None,
-        blocks_include_entries: None,
-        blocks_meta: false,
-        from_slot: None,
-        ping: None,
-        resub: None,
-        stats: false,
-        verify_encoding: false,
-    };
-    
-    match index_type {
-        "Accounts" => {
-            subscribe_args.accounts = true;
-            println!("\n📝 Account Indexing Options:");
-            
-            let account_input = Text::new("Enter account pubkey(s) to monitor (comma-separated, or press Enter for all):")
-                .prompt_skippable()?;
-            
-            if let Some(accounts) = account_input {
-                if !accounts.trim().is_empty() {
-                    subscribe_args.accounts_account = accounts
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-            
-            let owner_input = Text::new("Enter owner pubkey(s) to filter by (comma-separated, or press Enter to skip):")
-                .prompt_skippable()?;
-            
-            if let Some(owners) = owner_input {
-                if !owners.trim().is_empty() {
-                    subscribe_args.accounts_owner = owners
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-        },
-        "Transactions" => {
-            subscribe_args.transactions = true;
-            println!("\n📝 Transaction Indexing Options:");
-            
-            let include_accounts = Text::new("Enter account pubkey(s) to include in transactions (comma-separated, or press Enter to skip):")
-                .prompt_skippable()?;
-            
-            if let Some(accounts) = include_accounts {
-                if !accounts.trim().is_empty() {
-                    subscribe_args.transactions_account_include = accounts
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-            
-            let vote_txs = Select::new(
-                "Include vote transactions?",
-                vec!["Yes", "No", "All"]
-            )
-            .prompt()?;
-            
-            subscribe_args.transactions_vote = match vote_txs {
-                "Yes" => Some(true),
-                "No" => Some(false),
-                _ => None,
-            };
-            
-            let failed_txs = Select::new(
-                "Include failed transactions?",
-                vec!["Yes", "No", "All"]
-            )
-            .prompt()?;
-            
-            subscribe_args.transactions_failed = match failed_txs {
-                "Yes" => Some(true),
-                "No" => Some(false),
-                _ => None,
-            };
-        },
-        "Slots" => {
-            subscribe_args.slots = true;
-            println!("\n📝 Slot Indexing - Monitoring all slot updates");
-        },
-        "Blocks" => {
-            subscribe_args.blocks = true;
-            println!("\n📝 Block Indexing Options:");
-            
-            let include_txs = Select::new(
-                "Include transactions in blocks?",
-                vec!["Yes", "No"]
-            )
-            .prompt()?;
-            
-            subscribe_args.blocks_include_transactions = Some(include_txs == "Yes");
-            
-            let include_accounts = Select::new(
-                "Include accounts in blocks?",
-                vec!["Yes", "No"]
-            )
-            .prompt()?;
-            
-            subscribe_args.blocks_include_accounts = Some(include_accounts == "Yes");
-        },
-        "Entries" => {
-            subscribe_args.entries = true;
-            println!("\n📝 Entry Indexing - Monitoring all entry updates");
-        },
-        "Block Meta" => {
-            subscribe_args.blocks_meta = true;
-            println!("\n📝 Block Meta Indexing - Monitoring block metadata");
-        },
-        _ => {}
-    }
-    
-    Ok(subscribe_args)
+    info!(
+        "{kind} ({}) at {}.{:0>6}: {}",
+        filters.join(","),
+        unix_since.as_secs(),
+        unix_since.subsec_micros(),
+        serde_json::to_string(&value).expect("json serialization failed")
+    );
 }
