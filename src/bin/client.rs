@@ -227,6 +227,13 @@ impl From<ArgsCommitment> for CommitmentLevel {
     }
 }
 
+#[derive(Debug, Clone)]
+struct InteractiveConfig {
+    endpoint: String,
+    x_token: String,
+    commitment: Option<ArgsCommitment>,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum Action {
     /// Start interactive indexing (default mode)
@@ -601,6 +608,9 @@ impl Action {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file if it exists
+    let _ = dotenv::dotenv();
+    
     unsafe{
         env::set_var(
             env_logger::DEFAULT_FILTER_ENV,
@@ -611,6 +621,18 @@ async fn main() -> anyhow::Result<()> {
 
     let mut args = Args::parse();
     
+    // Override with .env values if CLI args use defaults
+    if args.endpoint == "https://solana-rpc.parafi.tech:10443" {
+        if let Ok(env_endpoint) = env::var("GRPC_ENDPOINT") {
+            args.endpoint = env_endpoint;
+        }
+    }
+    if args.x_token == "10443" {
+        if let Ok(env_token) = env::var("X_TOKEN") {
+            args.x_token = env_token;
+        }
+    }
+    
     // Default to Index (interactive mode) if no action specified
     // Note: This requires the subcommand to be optional, which clap supports
     if args.action.is_none() {
@@ -618,9 +640,11 @@ async fn main() -> anyhow::Result<()> {
     }
     
     // Handle Index action (interactive mode)
+    let mut interactive_config: Option<InteractiveConfig> = None;
     if matches!(args.action, Some(Action::Index)) {
-        let interactive_action = interactive_prompt().await?;
+        let (interactive_action, config) = interactive_prompt().await?;
         args.action = Some(interactive_action);
+        interactive_config = Some(config);
     }
     // Check if Subscribe action has no flags set (also run interactive)
     else if let Some(Action::Subscribe(subscribe_args)) = &args.action {
@@ -639,9 +663,38 @@ async fn main() -> anyhow::Result<()> {
         if is_empty {
             // Run interactive mode
             println!("🎯 No subscription options provided. Starting interactive mode...\n");
-            let interactive_action = interactive_prompt().await?;
+            let (interactive_action, config) = interactive_prompt().await?;
             args.action = Some(interactive_action);
+            interactive_config = Some(config);
         }
+    }
+    
+    // Apply interactive config if provided
+    if let Some(config) = interactive_config {
+        println!("\n📋 Configuration:");
+        println!("  Endpoint: {} {}", config.endpoint, if env::var("GRPC_ENDPOINT").is_ok() { "(from .env)" } else { "(default)" });
+        println!("  X-Token: {} {}", if config.x_token.len() > 10 { format!("{}...", &config.x_token[..10]) } else { config.x_token.clone() }, if env::var("X_TOKEN").is_ok() { "(from .env)" } else { "(default)" });
+        if let Some(commitment) = config.commitment {
+            println!("  Commitment Level: {:?}", commitment);
+        } else {
+            println!("  Commitment Level: Processed (default)");
+        }
+        println!();
+        
+        args.endpoint = config.endpoint;
+        args.x_token = config.x_token;
+        args.commitment = config.commitment;
+    } else {
+        // Show config even when not in interactive mode
+        println!("\n📋 Configuration:");
+        println!("  Endpoint: {} {}", args.endpoint, if env::var("GRPC_ENDPOINT").is_ok() { "(from .env)" } else { "(default)" });
+        println!("  X-Token: {} {}", if args.x_token.len() > 10 { format!("{}...", &args.x_token[..10]) } else { args.x_token.clone() }, if env::var("X_TOKEN").is_ok() { "(from .env)" } else { "(default)" });
+        if let Some(commitment) = args.commitment {
+            println!("  Commitment Level: {:?}", commitment);
+        } else {
+            println!("  Commitment Level: Processed (default)");
+        }
+        println!();
     }
     let zero_attempts = Arc::new(Mutex::new(true));
 
@@ -674,8 +727,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(Action::HealthCheck) => {
                     let response = client
-                        .health_check()
-                        .await
+                    .health_check()
+                    .await
                         .map_err(anyhow::Error::new)?;
                     print_health_check(&response);
                     Ok(())
@@ -714,8 +767,8 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(backoff::Error::transient),
                 Some(Action::GetLatestBlockhash) => {
                     let response = client
-                        .get_latest_blockhash(commitment)
-                        .await
+                    .get_latest_blockhash(commitment)
+                    .await
                         .map_err(anyhow::Error::new)?;
                     print_latest_blockhash(&response);
                     Ok(())
@@ -723,8 +776,8 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(backoff::Error::transient),
                 Some(Action::GetBlockHeight) => {
                     let response = client
-                        .get_block_height(commitment)
-                        .await
+                    .get_block_height(commitment)
+                    .await
                         .map_err(anyhow::Error::new)?;
                     print_block_height(&response);
                     Ok(())
@@ -732,8 +785,8 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(backoff::Error::transient),
                 Some(Action::GetSlot) => {
                     let response = client
-                        .get_slot(commitment)
-                        .await
+                    .get_slot(commitment)
+                    .await
                         .map_err(anyhow::Error::new)?;
                     print_slot(&response);
                     Ok(())
@@ -741,8 +794,8 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(backoff::Error::transient),
                 Some(Action::IsBlockhashValid { blockhash }) => {
                     let response = client
-                        .is_blockhash_valid(blockhash.clone(), commitment)
-                        .await
+                    .is_blockhash_valid(blockhash.clone(), commitment)
+                    .await
                         .map_err(anyhow::Error::new)?;
                     print_blockhash_valid(&response);
                     Ok(())
@@ -1303,8 +1356,38 @@ fn print_blockhash_valid<T: std::fmt::Debug>(response: &T) {
     print_query_result("Blockhash Validation", &data);
 }
 
-async fn interactive_prompt() -> anyhow::Result<Action> {
+async fn interactive_prompt() -> anyhow::Result<(Action, InteractiveConfig)> {
     println!("\n🚀 Welcome to Solana Real-Time Indexer CLI\n");
+    
+    // Load endpoint and x-token from .env or use defaults
+    let endpoint = env::var("GRPC_ENDPOINT")
+        .unwrap_or_else(|_| "https://solana-rpc.parafi.tech:10443".to_string());
+    let x_token = env::var("X_TOKEN")
+        .unwrap_or_else(|_| "10443".to_string());
+    
+    // Ask about commitment level only
+    let commitment_choice = Select::new(
+        "Select commitment level:",
+        vec![
+            "Processed (default, fastest)",
+            "Confirmed (buffered until confirmed)",
+            "Finalized (buffered until finalized)"
+        ]
+    )
+    .prompt()?;
+    
+    let commitment = match commitment_choice {
+        s if s.contains("Processed") => Some(ArgsCommitment::Processed),
+        s if s.contains("Confirmed") => Some(ArgsCommitment::Confirmed),
+        s if s.contains("Finalized") => Some(ArgsCommitment::Finalized),
+        _ => None,
+    };
+    
+    let config = InteractiveConfig {
+        endpoint,
+        x_token,
+        commitment,
+    };
     
     let main_choice = Select::new(
         "What would you like to do?",
@@ -1320,19 +1403,20 @@ async fn interactive_prompt() -> anyhow::Result<Action> {
             )
             .prompt()?;
             
-            match query_type {
-                "Get Latest Blockhash" => Ok(Action::GetLatestBlockhash),
-                "Get Block Height" => Ok(Action::GetBlockHeight),
-                "Get Slot" => Ok(Action::GetSlot),
+            let action = match query_type {
+                "Get Latest Blockhash" => Action::GetLatestBlockhash,
+                "Get Block Height" => Action::GetBlockHeight,
+                "Get Slot" => Action::GetSlot,
                 "Is Blockhash Valid" => {
                     let blockhash = Text::new("Enter blockhash to validate:")
                         .prompt()?;
-                    Ok(Action::IsBlockhashValid { blockhash })
+                    Action::IsBlockhashValid { blockhash }
                 }
                 _ => anyhow::bail!("Invalid query type"),
-            }
+            };
+            Ok((action, config))
         }
-        "Health Check" => Ok(Action::HealthCheck),
+        "Health Check" => Ok((Action::HealthCheck, config)),
         "Index Data (Subscribe)" => {
             let index_type = Select::new(
                 "What would you like to index?",
@@ -1340,7 +1424,8 @@ async fn interactive_prompt() -> anyhow::Result<Action> {
             )
             .prompt()?;
             
-            interactive_subscribe_prompt(index_type).await
+            let action = interactive_subscribe_prompt(index_type).await?;
+            Ok((action, config))
         }
         _ => anyhow::bail!("Invalid choice"),
     }
