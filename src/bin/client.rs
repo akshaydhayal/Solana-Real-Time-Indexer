@@ -503,10 +503,14 @@ impl Action {
 
                 let mut slots: SlotsFilterMap = HashMap::new();
                 if args.slots {
+                    // If commitment level is set, enable filtering by commitment for slots
+                    let filter_by_commitment = args.slots_filter_by_commitment
+                        .or_else(|| if commitment.is_some() { Some(true) } else { None });
+                    
                     slots.insert(
                         "client".to_owned(),
                         SubscribeRequestFilterSlots {
-                            filter_by_commitment: args.slots_filter_by_commitment,
+                            filter_by_commitment,
                             interslot_updates: args.slots_interslot_updates,
                         },
                     );
@@ -672,7 +676,11 @@ async fn main() -> anyhow::Result<()> {
     // Apply interactive config if provided
     if let Some(config) = interactive_config {
         println!("\n📋 Configuration:");
-        println!("  Endpoint: {} {}", config.endpoint, if env::var("GRPC_ENDPOINT").is_ok() { "(from .env)" } else { "(default)" });
+        let using_custom = env::var("GRPC_ENDPOINT").is_ok();
+        println!("  Endpoint: {} {}", config.endpoint, if using_custom { "(from .env - custom)" } else { "(default free endpoint)" });
+        if !using_custom {
+            println!("  💡 Tip: Use your own gRPC endpoint in .env for faster response!");
+        }
         println!("  X-Token: {} {}", if config.x_token.len() > 10 { format!("{}...", &config.x_token[..10]) } else { config.x_token.clone() }, if env::var("X_TOKEN").is_ok() { "(from .env)" } else { "(default)" });
         if let Some(commitment) = config.commitment {
             println!("  Commitment Level: {:?}", commitment);
@@ -687,7 +695,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // Show config even when not in interactive mode
         println!("\n📋 Configuration:");
-        println!("  Endpoint: {} {}", args.endpoint, if env::var("GRPC_ENDPOINT").is_ok() { "(from .env)" } else { "(default)" });
+        let using_custom = env::var("GRPC_ENDPOINT").is_ok();
+        println!("  Endpoint: {} {}", args.endpoint, if using_custom { "(from .env - custom)" } else { "(default free endpoint)" });
+        if !using_custom {
+            println!("  💡 Tip: Use your own gRPC endpoint in .env for faster response!");
+        }
         println!("  X-Token: {} {}", if args.x_token.len() > 10 { format!("{}...", &args.x_token[..10]) } else { args.x_token.clone() }, if env::var("X_TOKEN").is_ok() { "(from .env)" } else { "(default)" });
         if let Some(commitment) = args.commitment {
             println!("  Commitment Level: {:?}", commitment);
@@ -1358,6 +1370,8 @@ fn print_blockhash_valid<T: std::fmt::Debug>(response: &T) {
 
 async fn interactive_prompt() -> anyhow::Result<(Action, InteractiveConfig)> {
     println!("\n🚀 Welcome to Solana Real-Time Indexer CLI\n");
+    println!("💡 Tip: Use your own gRPC endpoint in .env file for faster response!");
+    println!("   Edit .env and set GRPC_ENDPOINT and X_TOKEN with your custom endpoint.\n");
     
     // Load endpoint and x-token from .env or use defaults
     let endpoint = env::var("GRPC_ENDPOINT")
@@ -1365,69 +1379,136 @@ async fn interactive_prompt() -> anyhow::Result<(Action, InteractiveConfig)> {
     let x_token = env::var("X_TOKEN")
         .unwrap_or_else(|_| "10443".to_string());
     
-    // Ask about commitment level only
-    let commitment_choice = Select::new(
-        "Select commitment level:",
-        vec![
-            "Processed (default, fastest)",
-            "Confirmed (buffered until confirmed)",
-            "Finalized (buffered until finalized)"
-        ]
+    // Create hierarchical menu - separate display items from selectable items
+    // Display items include headings for visual hierarchy
+    let display_items = vec![
+        // Index Data section
+        "📊 INDEX DATA (Subscribe)",
+        "    ├─ Accounts",
+        "    ├─ Transactions",
+        "    ├─ Slots",
+        "    ├─ Blocks",
+        "    ├─ Entries",
+        "    └─ Block Meta",
+        "",
+        "🔍 QUERY COMMANDS",
+        "    ├─ Get Latest Blockhash",
+        "    ├─ Get Block Height",
+        "    ├─ Get Slot",
+        "    └─ Is Blockhash Valid",
+        "",
+        "❤️  HEALTH CHECK",
+        "    └─ Health Check",
+    ];
+    
+    // Create selectable items only (no headings, no empty lines)
+    let selectable_items: Vec<String> = display_items
+        .iter()
+        .filter(|item| {
+            let trimmed = item.trim();
+            !trimmed.is_empty() 
+                && !trimmed.contains("INDEX DATA")
+                && !trimmed.contains("QUERY COMMANDS")
+                && !trimmed.contains("HEALTH CHECK")
+                && (trimmed.contains("├─") || trimmed.contains("└─"))
+        })
+        .map(|s| s.to_string())
+        .collect();
+    
+    // Print the menu structure for visual reference
+    println!("\n{}", display_items.join("\n"));
+    println!();
+    
+    let page_size = selectable_items.len(); // Get length before moving
+    let choice = Select::new(
+        "Select an option (use ↑↓ to navigate):",
+        selectable_items
     )
+    .with_page_size(page_size.min(20)) // Show all items at once (max 20 for safety)
     .prompt()?;
     
-    let commitment = match commitment_choice {
-        s if s.contains("Processed") => Some(ArgsCommitment::Processed),
-        s if s.contains("Confirmed") => Some(ArgsCommitment::Confirmed),
-        s if s.contains("Finalized") => Some(ArgsCommitment::Finalized),
-        _ => None,
-    };
+    // Parse the selection - check original choice before trimming
+    let trimmed = choice.trim();
     
-    let config = InteractiveConfig {
-        endpoint,
-        x_token,
-        commitment,
-    };
-    
-    let main_choice = Select::new(
-        "What would you like to do?",
-        vec!["Index Data (Subscribe)", "Query Commands", "Health Check"]
-    )
-    .prompt()?;
-    
-    match main_choice {
-        "Query Commands" => {
-            let query_type = Select::new(
-                "Select a query command:",
-                vec!["Get Latest Blockhash", "Get Block Height", "Get Slot", "Is Blockhash Valid"]
-            )
-            .prompt()?;
-            
-            let action = match query_type {
-                "Get Latest Blockhash" => Action::GetLatestBlockhash,
-                "Get Block Height" => Action::GetBlockHeight,
-                "Get Slot" => Action::GetSlot,
-                "Is Blockhash Valid" => {
-                    let blockhash = Text::new("Enter blockhash to validate:")
-                        .prompt()?;
-                    Action::IsBlockhashValid { blockhash }
-                }
-                _ => anyhow::bail!("Invalid query type"),
-            };
-            Ok((action, config))
+    // Check if it's a sub-option (contains tree characters)
+    if choice.contains("├─") || choice.contains("└─") {
+        // Extract the option name after the tree character
+        // Use replace to remove the tree characters and spaces, then trim
+        let clean_option = choice
+            .replace("├─", "")
+            .replace("└─", "")
+            .trim()
+            .to_string();
+        
+        // Ask about commitment level after selecting an option
+        let commitment_choice = Select::new(
+            "Select commitment level:",
+            vec![
+                "Processed (default, fastest)",
+                "Confirmed (buffered until confirmed)",
+                "Finalized (buffered until finalized)"
+            ]
+        )
+        .prompt()?;
+        
+        let commitment = match commitment_choice {
+            s if s.contains("Processed") => Some(ArgsCommitment::Processed),
+            s if s.contains("Confirmed") => Some(ArgsCommitment::Confirmed),
+            s if s.contains("Finalized") => Some(ArgsCommitment::Finalized),
+            _ => None,
+        };
+        
+        let config = InteractiveConfig {
+            endpoint,
+            x_token,
+            commitment,
+        };
+        
+        match clean_option.as_str() {
+            "Accounts" => {
+                let action = interactive_subscribe_prompt("Accounts").await?;
+                Ok((action, config))
+            }
+            "Transactions" => {
+                let action = interactive_subscribe_prompt("Transactions").await?;
+                Ok((action, config))
+            }
+            "Slots" => {
+                let action = interactive_subscribe_prompt("Slots").await?;
+                Ok((action, config))
+            }
+            "Blocks" => {
+                let action = interactive_subscribe_prompt("Blocks").await?;
+                Ok((action, config))
+            }
+            "Entries" => {
+                let action = interactive_subscribe_prompt("Entries").await?;
+                Ok((action, config))
+            }
+            "Block Meta" => {
+                let action = interactive_subscribe_prompt("Block Meta").await?;
+                Ok((action, config))
+            }
+            "Get Latest Blockhash" => Ok((Action::GetLatestBlockhash, config)),
+            "Get Block Height" => Ok((Action::GetBlockHeight, config)),
+            "Get Slot" => Ok((Action::GetSlot, config)),
+            "Is Blockhash Valid" => {
+                let blockhash = Text::new("Enter blockhash to validate:")
+                    .prompt()?;
+                Ok((Action::IsBlockhashValid { blockhash }, config))
+            }
+            "Health Check" => Ok((Action::HealthCheck, config)),
+            _ => anyhow::bail!("Invalid option selected: {}", clean_option),
         }
-        "Health Check" => Ok((Action::HealthCheck, config)),
-        "Index Data (Subscribe)" => {
-            let index_type = Select::new(
-                "What would you like to index?",
-                vec!["Accounts", "Transactions", "Slots", "Blocks", "Entries", "Block Meta"]
-            )
-            .prompt()?;
-            
-            let action = interactive_subscribe_prompt(index_type).await?;
-            Ok((action, config))
-        }
-        _ => anyhow::bail!("Invalid choice"),
+    } else if trimmed.is_empty() {
+        // Empty line separator - should not be selectable, but handle it
+        anyhow::bail!("Please select a valid option from the menu.")
+    } else if trimmed.contains("INDEX DATA") || trimmed.contains("QUERY COMMANDS") || trimmed.contains("HEALTH CHECK") {
+        // User selected a heading - show error
+        anyhow::bail!("Please select a specific option (indented items), not a heading.")
+    } else {
+        // Fallback - try to match anyway
+        anyhow::bail!("Please select a valid option from the menu.")
     }
 }
 
