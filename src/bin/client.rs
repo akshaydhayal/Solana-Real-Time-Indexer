@@ -619,8 +619,8 @@ async fn main() -> anyhow::Result<()> {
     
     // Handle Index action (interactive mode)
     if matches!(args.action, Some(Action::Index)) {
-        let interactive_args = interactive_prompt().await?;
-        args.action = Some(Action::Subscribe(Box::new(interactive_args)));
+        let interactive_action = interactive_prompt().await?;
+        args.action = Some(interactive_action);
     }
     // Check if Subscribe action has no flags set (also run interactive)
     else if let Some(Action::Subscribe(subscribe_args)) = &args.action {
@@ -639,8 +639,8 @@ async fn main() -> anyhow::Result<()> {
         if is_empty {
             // Run interactive mode
             println!("🎯 No subscription options provided. Starting interactive mode...\n");
-            let interactive_args = interactive_prompt().await?;
-            args.action = Some(Action::Subscribe(Box::new(interactive_args)));
+            let interactive_action = interactive_prompt().await?;
+            args.action = Some(interactive_action);
         }
     }
     let zero_attempts = Arc::new(Mutex::new(true));
@@ -672,11 +672,14 @@ async fn main() -> anyhow::Result<()> {
                         "Index action should have been converted to Subscribe"
                     )));
                 }
-                Some(Action::HealthCheck) => client
-                    .health_check()
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
+                Some(Action::HealthCheck) => {
+                    let response = client
+                        .health_check()
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    print_health_check(&response);
+                    Ok(())
+                }
                     .map_err(backoff::Error::transient),
                 Some(Action::HealthWatch) => geyser_health_watch(client)
                     .await
@@ -709,29 +712,41 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(anyhow::Error::new)
                     .map(|response| info!("response: {response:?}"))
                     .map_err(backoff::Error::transient),
-                Some(Action::GetLatestBlockhash) => client
-                    .get_latest_blockhash(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
+                Some(Action::GetLatestBlockhash) => {
+                    let response = client
+                        .get_latest_blockhash(commitment)
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    print_latest_blockhash(&response);
+                    Ok(())
+                }
                     .map_err(backoff::Error::transient),
-                Some(Action::GetBlockHeight) => client
-                    .get_block_height(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
+                Some(Action::GetBlockHeight) => {
+                    let response = client
+                        .get_block_height(commitment)
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    print_block_height(&response);
+                    Ok(())
+                }
                     .map_err(backoff::Error::transient),
-                Some(Action::GetSlot) => client
-                    .get_slot(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
+                Some(Action::GetSlot) => {
+                    let response = client
+                        .get_slot(commitment)
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    print_slot(&response);
+                    Ok(())
+                }
                     .map_err(backoff::Error::transient),
-                Some(Action::IsBlockhashValid { blockhash }) => client
-                    .is_blockhash_valid(blockhash.clone(), commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}"))
+                Some(Action::IsBlockhashValid { blockhash }) => {
+                    let response = client
+                        .is_blockhash_valid(blockhash.clone(), commitment)
+                        .await
+                        .map_err(anyhow::Error::new)?;
+                    print_blockhash_valid(&response);
+                    Ok(())
+                }
                     .map_err(backoff::Error::transient),
                 Some(Action::GetVersion) => client
                     .get_version()
@@ -1150,14 +1165,188 @@ fn print_update(kind: &str, created_at: SystemTime, filters: &[String], value: V
     io::stdout().flush().unwrap();
 }
 
-async fn interactive_prompt() -> anyhow::Result<ActionSubscribe> {
+fn print_query_result(title: &str, data: &[(String, String)]) {
+    println!("\n{}", "=".repeat(80));
+    println!("🔍 {}", title);
+    println!("{}", "-".repeat(80));
+    
+    for (key, value) in data {
+        // Capitalize first letter of key
+        let formatted_key = if key.is_empty() {
+            key.clone()
+        } else {
+            let mut chars = key.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        };
+        println!("  {}: {}", formatted_key, value);
+    }
+    
+    println!("{}", "=".repeat(80));
+    io::stdout().flush().unwrap();
+}
+
+fn print_health_check<T: std::fmt::Debug>(response: &T) {
+    let debug_str = format!("{:#?}", response);
+    let data = vec![
+        ("Response".to_string(), debug_str),
+    ];
+    print_query_result("Health Check Result", &data);
+}
+
+fn print_latest_blockhash<T: std::fmt::Debug>(response: &T) {
+    let debug_str = format!("{:#?}", response);
+    // Parse structured debug output
+    let mut data = Vec::new();
+    
+    // Look for key-value pairs in the debug output
+    for line in debug_str.lines() {
+        let trimmed = line.trim();
+        // Match patterns like "slot: 123" or "blockhash: \"abc\""
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = value.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ');
+            
+            if key.contains("slot") || key.contains("blockhash") || key.contains("last_valid") || key.contains("block_height") {
+                let display_key = if key.contains("slot") {
+                    "Slot"
+                } else if key.contains("blockhash") {
+                    "Blockhash"
+                } else if key.contains("last_valid") {
+                    "Last Valid Block Height"
+                } else {
+                    "Block Height"
+                };
+                data.push((display_key.to_string(), value.to_string()));
+            }
+        }
+    }
+    
+    if data.is_empty() {
+        // Fallback: show formatted debug output
+        data.push(("Response".to_string(), debug_str));
+    }
+    print_query_result("Latest Blockhash", &data);
+}
+
+fn print_block_height<T: std::fmt::Debug>(response: &T) {
+    let debug_str = format!("{:#?}", response);
+    let mut data = Vec::new();
+    
+    for line in debug_str.lines() {
+        let trimmed = line.trim();
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = value.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ');
+            
+            if key.contains("block_height") || key.contains("height") {
+                data.push(("Block Height".to_string(), value.to_string()));
+            }
+        }
+    }
+    
+    if data.is_empty() {
+        data.push(("Response".to_string(), debug_str));
+    }
+    print_query_result("Block Height", &data);
+}
+
+fn print_slot<T: std::fmt::Debug>(response: &T) {
+    let debug_str = format!("{:#?}", response);
+    let mut data = Vec::new();
+    
+    for line in debug_str.lines() {
+        let trimmed = line.trim();
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim().to_lowercase();
+            let value = value.trim().trim_matches(|c| c == '"' || c == ',' || c == ' ');
+            
+            if key.contains("slot") {
+                data.push(("Slot".to_string(), value.to_string()));
+            }
+        }
+    }
+    
+    if data.is_empty() {
+        data.push(("Response".to_string(), debug_str));
+    }
+    print_query_result("Current Slot", &data);
+}
+
+fn print_blockhash_valid<T: std::fmt::Debug>(response: &T) {
+    let debug_str = format!("{:#?}", response);
+    let lines: Vec<&str> = debug_str.lines().collect();
+    let mut data = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.contains("valid") {
+            if let Some((key, value)) = trimmed.split_once(':') {
+                let key = key.trim().trim_start_matches(|c| c == '(' || c == ')');
+                let value = value.trim().trim_matches(|c| c == '"' || c == ',');
+                let is_valid = value == "true";
+                let status_emoji = if is_valid { "✅" } else { "❌" };
+                data.push((key.to_string(), format!("{} {}", status_emoji, value)));
+            }
+        } else if trimmed.contains("slot") {
+            if let Some((key, value)) = trimmed.split_once(':') {
+                let key = key.trim().trim_start_matches(|c| c == '(' || c == ')');
+                let value = value.trim().trim_matches(|c| c == '"' || c == ',');
+                data.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    if data.is_empty() {
+        data.push(("Response".to_string(), debug_str));
+    }
+    print_query_result("Blockhash Validation", &data);
+}
+
+async fn interactive_prompt() -> anyhow::Result<Action> {
     println!("\n🚀 Welcome to Solana Real-Time Indexer CLI\n");
     
-    let index_type = Select::new(
-        "What would you like to index?",
-        vec!["Accounts", "Transactions", "Slots", "Blocks", "Entries", "Block Meta"]
+    let main_choice = Select::new(
+        "What would you like to do?",
+        vec!["Index Data (Subscribe)", "Query Commands", "Health Check"]
     )
     .prompt()?;
+    
+    match main_choice {
+        "Query Commands" => {
+            let query_type = Select::new(
+                "Select a query command:",
+                vec!["Get Latest Blockhash", "Get Block Height", "Get Slot", "Is Blockhash Valid"]
+            )
+            .prompt()?;
+            
+            match query_type {
+                "Get Latest Blockhash" => Ok(Action::GetLatestBlockhash),
+                "Get Block Height" => Ok(Action::GetBlockHeight),
+                "Get Slot" => Ok(Action::GetSlot),
+                "Is Blockhash Valid" => {
+                    let blockhash = Text::new("Enter blockhash to validate:")
+                        .prompt()?;
+                    Ok(Action::IsBlockhashValid { blockhash })
+                }
+                _ => anyhow::bail!("Invalid query type"),
+            }
+        }
+        "Health Check" => Ok(Action::HealthCheck),
+        "Index Data (Subscribe)" => {
+            let index_type = Select::new(
+                "What would you like to index?",
+                vec!["Accounts", "Transactions", "Slots", "Blocks", "Entries", "Block Meta"]
+            )
+            .prompt()?;
+            
+            interactive_subscribe_prompt(index_type).await
+        }
+        _ => anyhow::bail!("Invalid choice"),
+    }
+}
+
+async fn interactive_subscribe_prompt(index_type: &str) -> anyhow::Result<Action> {
     
     let mut subscribe_args = ActionSubscribe {
         accounts: false,
@@ -1308,5 +1497,5 @@ async fn interactive_prompt() -> anyhow::Result<ActionSubscribe> {
         _ => {}
     }
     
-    Ok(subscribe_args)
+    Ok(Action::Subscribe(Box::new(subscribe_args)))
 }
